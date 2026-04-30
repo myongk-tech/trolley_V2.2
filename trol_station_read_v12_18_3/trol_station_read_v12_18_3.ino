@@ -235,8 +235,8 @@ constexpr uint8_t  STS_SERVO_ID             = 1;
 constexpr uint32_t STS_SERVO_BAUD           = 1000000UL;
 constexpr int      STS_SERVO_UART_RX        = D0;
 constexpr int      STS_SERVO_UART_TX        = D1;
-constexpr uint16_t STS_SERVO_POS_0DEG_DEF   = 0;
-constexpr uint16_t STS_SERVO_POS_180DEG_DEF = 2048;
+constexpr uint16_t STS_SERVO_POS_0DEG_DEF   = 75;
+constexpr uint16_t STS_SERVO_POS_180DEG_DEF = 2150;
 constexpr uint16_t STS_SERVO_SPEED          = 1500;
 constexpr uint8_t  STS_SERVO_ACC            = 50;
 // STS3215 at STS_SERVO_SPEED=1500 steps/s travels 2048 steps in ~1.37 s.
@@ -246,8 +246,8 @@ constexpr uint32_t SERVO_RETURN_WAIT_MS     = 1500;
 constexpr uint16_t DS_SERVO_MIN_PULSE_US     = 500;
 constexpr uint16_t DS_SERVO_MAX_PULSE_US     = 2500;
 constexpr uint16_t DS_SERVO_CENTER_PULSE_US  = 1500;
-constexpr uint16_t DS_SERVO_PULSE_0DEG_DEF   = 1000;
-constexpr uint16_t DS_SERVO_PULSE_180DEG_DEF = 2000;
+constexpr uint16_t DS_SERVO_PULSE_0DEG_DEF   = 680;
+constexpr uint16_t DS_SERVO_PULSE_180DEG_DEF = 1960;
 
 // ── BNO055 IMU ────────────────────────────────────────────────────────────
 constexpr uint8_t  IMU_I2C_ADDR          = 0x28;
@@ -262,9 +262,14 @@ constexpr int      IMU_SERVO_ANGLE_MAX   = 180;
 constexpr int      DS_SERVO_NEUTRAL_DEG  = 90;
 
 // ── User-adjustable defaults ──────────────────────────────────────────────
-constexpr float    MAX_SPEED_PCT_DEF       = 18.0f;
-constexpr float    APPROACH_SLOW_PCT_DEF   = 4.0f;   // speed inside approach zone
-constexpr int32_t  APPROACH_ZONE_DEF_COUNTS = 2500000; // enc counts from target to start slowing
+constexpr float    MAX_SPEED_PCT_DEF       = 12.0f;
+constexpr float    APPROACH_SLOW_PCT_DEF   = 6.0f;   // speed inside approach zone
+constexpr int32_t  APPROACH_ZONE_DEF_COUNTS = 3000000; // enc counts from target to start slowing
+constexpr float    DRIVE_RATIO_DEF         = 17.07f;
+constexpr bool     ENC_INVERT_DEF          = true;
+constexpr float    DEMO_THROTTLE_PCT_DEF   = 12.0f;  // demo cruise speed
+constexpr uint32_t DEMO_BOARDING_WAIT_MS   = 4000;   // STS3215 at 180 before returning to 0
+constexpr uint32_t DEMO_DRONE_WAIT_MS      = 10000;  // wait at drone-pickup before next leg
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  GLOBAL STATE
@@ -322,6 +327,32 @@ uint8_t stationCount = 0;
 bool     servoReturnPending = false;
 uint32_t servoReturnStartMs = 0;
 int      pendingGotoIdx     = -1;
+
+// ── Demo automation state machine ────────────────────────────────────────
+// The demo button on the home page chains a fixed routine:
+//   1. Re-zero IMU + zero encoder
+//   2. STS3215 to 180° (boarding pose), hold for 4 s
+//   3. STS3215 back to 0°, wait for travel time
+//   4. Goto Drone Pickup station (uses normal approach-zone slow-down)
+//   5. Hold at Drone Pickup for 10 s (countdown reported to UI)
+//   6. Goto Drive Thru station — onStationArrival() spins STS to 180° and
+//      re-zeros the encoder, then the demo returns to idle awaiting another
+//      press of the demo button.
+enum DemoState : uint8_t {
+  DEMO_IDLE = 0,
+  DEMO_IMU_REZERO,         // waiting for IMU calibration to finish
+  DEMO_BOARDING_180,       // STS at 180°, holding 4 s
+  DEMO_BOARDING_RETURN,    // STS commanded back to 0°, waiting for travel
+  DEMO_GOTO_DRONE,         // motion in progress to drone-pickup station
+  DEMO_AT_DRONE_WAIT,      // stopped at drone pickup, 10 s countdown
+  DEMO_GOTO_DRIVETHRU,     // motion in progress to drive-thru station
+};
+
+DemoState demoState           = DEMO_IDLE;
+uint32_t  demoStateStartMs    = 0;
+uint32_t  demoStateDurationMs = 0;   // for timed waits — reported to UI
+int       demoDroneStationIdx = -1;
+int       demoDriveThruIdx    = -1;
 
 // Timers
 uint32_t bootArmStartMs=0, userArmStartMs=0;
@@ -405,6 +436,11 @@ static void updateIMUCalibration();
 static void updateIMU();
 static bool dsServoAttachOrReattach();
 void updateLEDs();
+static int findFirstStationOfType(StationType t);
+static bool startDemo();
+static void cancelDemo(const char* reason);
+static void updateDemo();
+static const char* demoStateName(DemoState s);
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  ESC HELPERS  (MAXYNOS 70A AM32 — bidirectional, raw LEDC)
@@ -741,6 +777,24 @@ void onStationArrival(int idx) {
 
   gotoStationIdx    = -1;
   gotoTargetCount   = 0;
+
+  // ── Demo state-machine arrival hooks ────────────────────────────────────
+  // These run after the regular per-type behaviour (e.g. Drive Thru already
+  // rotated the STS3215 to 180° and zeroed the encoder above), so the demo
+  // just needs to schedule the next step.
+  if (demoState == DEMO_GOTO_DRONE && idx == demoDroneStationIdx) {
+    demoState           = DEMO_AT_DRONE_WAIT;
+    demoStateStartMs    = millis();
+    demoStateDurationMs = DEMO_DRONE_WAIT_MS;
+    Serial.println("Demo: arrived at Drone Pickup; waiting 10 s.");
+  } else if (demoState == DEMO_GOTO_DRIVETHRU && idx == demoDriveThruIdx) {
+    Serial.println("Demo: arrived at Drive Thru; routine complete. Press Demo again to repeat.");
+    demoState           = DEMO_IDLE;
+    demoStateStartMs    = 0;
+    demoStateDurationMs = 0;
+    demoDroneStationIdx = -1;
+    demoDriveThruIdx    = -1;
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -847,9 +901,9 @@ void loadPrefs() {
   approachSlowPct   = prefs.getFloat("apSlw",   APPROACH_SLOW_PCT_DEF);
   approachZoneCount = (int32_t)prefs.getInt("apZone", (int)APPROACH_ZONE_DEF_COUNTS);
   countsPerRev      = (uint16_t)prefs.getUInt("cpr",  AS5047_CPR_DEFAULT);
-  driveRatio        = prefs.getFloat("drive",   1.0f);
+  driveRatio        = prefs.getFloat("drive",   DRIVE_RATIO_DEF);
   pitchDiamM        = prefs.getFloat("pitch",   100.f)/1000.f;
-  encInvert         = prefs.getBool ("encInv",  false);  // default: positive counts forward
+  encInvert         = prefs.getBool ("encInv",  ENC_INVERT_DEF);
   stsServoPos0      = (uint16_t)constrain(prefs.getUInt("sv0",   STS_SERVO_POS_0DEG_DEF),   0U, 4095U);
   stsServoPos180    = (uint16_t)constrain(prefs.getUInt("sv180", STS_SERVO_POS_180DEG_DEF), 0U, 4095U);
   dsServoPulse0     = (uint16_t)constrain(prefs.getUInt("dsv0",   DS_SERVO_PULSE_0DEG_DEF),
@@ -1144,6 +1198,167 @@ void updateLEDs() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  DEMO STATE MACHINE
+//  Drives the home-page "Start Demo" button through a fixed routine.
+//  All transitions are non-blocking: each step sets demoStateStartMs +
+//  demoStateDurationMs (when applicable) and updateDemo() polls them on the
+//  main loop.  onStationArrival() advances DEMO_GOTO_* states to the
+//  corresponding wait/finish state.  cancelDemo() is invoked from the Stop
+//  command and from any aborted goto so the demo never drives the trolley
+//  unattended after the user intervenes.
+// ═══════════════════════════════════════════════════════════════════════════
+static const char* demoStateName(DemoState s) {
+  switch (s) {
+    case DEMO_IDLE:             return "idle";
+    case DEMO_IMU_REZERO:       return "imu-rezero";
+    case DEMO_BOARDING_180:     return "boarding-180";
+    case DEMO_BOARDING_RETURN:  return "boarding-return";
+    case DEMO_GOTO_DRONE:       return "goto-drone";
+    case DEMO_AT_DRONE_WAIT:    return "at-drone-wait";
+    case DEMO_GOTO_DRIVETHRU:   return "goto-drivethru";
+    default:                    return "?";
+  }
+}
+
+static int findFirstStationOfType(StationType t) {
+  for (uint8_t i = 0; i < MAX_STATIONS; i++) {
+    if (stations[i].active && stations[i].type == t) return i;
+  }
+  return -1;
+}
+
+// Returns true if the demo was kicked off.  Reasons it may decline:
+//   - ESC not ready / motor not user-armed
+//   - missing Drone Pickup or Drive Thru station
+//   - already running (re-press is ignored, not restarted, until DEMO_IDLE)
+static bool startDemo() {
+  if (!escReady || !userArmed) {
+    Serial.println("Demo: declined — ESC not ready or motor not armed.");
+    return false;
+  }
+  if (demoState != DEMO_IDLE) {
+    Serial.printf("Demo: already running (%s) — ignoring start.\n", demoStateName(demoState));
+    return false;
+  }
+  demoDroneStationIdx = findFirstStationOfType(ST_DRONE_PICKUP);
+  demoDriveThruIdx    = findFirstStationOfType(ST_DRIVE_THRU);
+  if (demoDroneStationIdx < 0 || demoDriveThruIdx < 0) {
+    Serial.println("Demo: declined — need at least one Drone Pickup and one Drive Thru station.");
+    return false;
+  }
+
+  Serial.println("Demo: starting routine.");
+
+  // Force the trolley to drive at the demo cruise speed (clamped by the user's
+  // configured max speed limit).  Without this the demo would inherit whatever
+  // value the Speed Control slider was last left at — including 0 %, which
+  // would silently leave the motor stationary.
+  const float demoPct = (DEMO_THROTTLE_PCT_DEF < maxSpeedPct) ? DEMO_THROTTLE_PCT_DEF : maxSpeedPct;
+  throttlePct  = (uint8_t)constrain((int)demoPct, 1, (int)maxSpeedPct);
+  motorReverse = false;
+
+  // Step 1: IMU re-zero + encoder zero.  If the IMU isn't available we just
+  // skip the calibration wait and proceed; encoder zero still happens.
+  requestEncoderZero();
+  if (imuReady) {
+    beginIMUCalibration();
+    dsServoMove(DS_SERVO_NEUTRAL_DEG, "demo-imu-rezero");
+    demoState = DEMO_IMU_REZERO;
+  } else {
+    // Skip straight to the boarding pose if no IMU is available.
+    stsServoMove(stsServoPos180, "demo-boarding");
+    demoState = DEMO_BOARDING_180;
+    demoStateStartMs    = millis();
+    demoStateDurationMs = DEMO_BOARDING_WAIT_MS;
+  }
+  return true;
+}
+
+static void cancelDemo(const char* reason) {
+  if (demoState == DEMO_IDLE) return;
+  Serial.printf("Demo: cancelled in %s (%s).\n", demoStateName(demoState), reason);
+  demoState           = DEMO_IDLE;
+  demoStateStartMs    = 0;
+  demoStateDurationMs = 0;
+  demoDroneStationIdx = -1;
+  demoDriveThruIdx    = -1;
+}
+
+static void updateDemo() {
+  if (demoState == DEMO_IDLE) return;
+
+  // Safety: any time the user's arming status drops out, abort.
+  if (!escReady || !userArmed) {
+    cancelDemo("disarmed");
+    return;
+  }
+
+  const uint32_t now = millis();
+
+  switch (demoState) {
+
+    case DEMO_IMU_REZERO: {
+      // Wait for the IMU calibration routine (or timeout fallback) to finish,
+      // then move the STS3215 to its 180° boarding pose.
+      if (imuCalibrating) return;
+      stsServoMove(stsServoPos180, "demo-boarding");
+      demoState           = DEMO_BOARDING_180;
+      demoStateStartMs    = now;
+      demoStateDurationMs = DEMO_BOARDING_WAIT_MS;
+      Serial.println("Demo: IMU re-zeroed; STS3215 -> 180° (boarding) for 4 s.");
+      break;
+    }
+
+    case DEMO_BOARDING_180: {
+      if (now - demoStateStartMs < demoStateDurationMs) return;
+      // Return STS3215 to 0° and wait for the rotation to finish before driving.
+      stsServoMove(stsServoPos0, "demo-boarding-return");
+      demoState           = DEMO_BOARDING_RETURN;
+      demoStateStartMs    = now;
+      demoStateDurationMs = SERVO_RETURN_WAIT_MS;
+      Serial.println("Demo: boarding hold complete; STS3215 -> 0°, then to Drone Pickup.");
+      break;
+    }
+
+    case DEMO_BOARDING_RETURN: {
+      if (now - demoStateStartMs < demoStateDurationMs) return;
+      if (demoDroneStationIdx < 0 || !stations[demoDroneStationIdx].active) {
+        cancelDemo("drone station missing");
+        return;
+      }
+      startGotoMotion(demoDroneStationIdx);
+      demoState           = DEMO_GOTO_DRONE;
+      demoStateStartMs    = now;
+      demoStateDurationMs = 0;
+      break;
+    }
+
+    case DEMO_AT_DRONE_WAIT: {
+      // 10 s countdown reported to the UI via /status (demoTimeRemainingMs).
+      if (now - demoStateStartMs < demoStateDurationMs) return;
+      if (demoDriveThruIdx < 0 || !stations[demoDriveThruIdx].active) {
+        cancelDemo("drive-thru station missing");
+        return;
+      }
+      startGotoMotion(demoDriveThruIdx);
+      demoState           = DEMO_GOTO_DRIVETHRU;
+      demoStateStartMs    = now;
+      demoStateDurationMs = 0;
+      Serial.println("Demo: drone-pickup wait complete; heading to Drive Thru.");
+      break;
+    }
+
+    case DEMO_GOTO_DRONE:
+    case DEMO_GOTO_DRIVETHRU:
+      // Advanced from onStationArrival() — nothing to do here.
+      break;
+
+    default:
+      break;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  WEB PAGE
 // ═══════════════════════════════════════════════════════════════════════════
 static const char INDEX_HTML[] PROGMEM = R"rawhtml(
@@ -1158,7 +1373,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawhtml(
       --warn:#ffc800;--pur:#c084fc;--txt:#e8e8f0;--mut:#6b6b80;--r:14px;}
 *{box-sizing:border-box;margin:0;padding:0;}
 body{background:var(--bg);color:var(--txt);font-family:'Segoe UI',system-ui,sans-serif;
-     min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:18px 14px;}
+     min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:12px 14px 18px;}
 h1{font-size:1.3rem;letter-spacing:.08em;color:var(--acc);margin-bottom:3px;}
 .sub{color:var(--mut);font-size:.82rem;margin-bottom:18px;}
 .card{background:var(--card);border-radius:var(--r);padding:20px 18px;width:100%;
@@ -1212,7 +1427,7 @@ button:disabled{opacity:.3;cursor:not-allowed;}
 .bzero{background:#3f3f46;color:#fafafa;}
 .bsv0{background:#1f2937;color:#d1d5db;}
 .bsv180{background:#7c2d12;color:#ffedd5;}
-.bn{position:sticky;top:0;z-index:2;background:rgba(255,200,0,.15);color:var(--warn);
+.bn{background:rgba(255,200,0,.15);color:var(--warn);
     border:1px solid rgba(255,200,0,.3);padding:10px 14px;border-radius:12px;max-width:420px;
     width:100%;margin-bottom:12px;text-align:center;font-size:.84rem;}
 .bn.h{display:none;}
@@ -1248,12 +1463,66 @@ button:disabled{opacity:.3;cursor:not-allowed;}
      background:rgba(0,200,255,.15);color:var(--acc);font-weight:800;min-width:90px;}
 .svb.p180{background:rgba(250,204,21,.15);color:#facc15;}
 .svb.off{background:rgba(255,68,68,.15);color:var(--dan);}
+/* ── Home / Advanced layout ─────────────────────────────────────────────── */
+.appbar{position:sticky;top:0;z-index:5;display:flex;align-items:center;justify-content:space-between;
+  width:100%;max-width:420px;padding:6px 4px 14px;background:var(--bg);}
+.appbar .ttl{font-size:1.3rem;letter-spacing:.08em;color:var(--acc);font-weight:700;}
+.hburg{background:#1f2937;color:#d1d5db;border:none;border-radius:10px;
+  width:42px;height:42px;font-size:1.1rem;cursor:pointer;flex:none;padding:0;
+  display:flex;align-items:center;justify-content:center;transition:.18s;}
+.hburg:active{transform:scale(.94);} .hburg.act{background:#7c2d12;color:#ffedd5;}
+#homeView,#advView{display:flex;flex-direction:column;align-items:center;width:100%;}
+#advView{display:none;}
+body.adv #homeView{display:none;} body.adv #advView{display:flex;}
+.bdemo{background:linear-gradient(135deg,#16a34a,#22c55e);color:white;
+  font-size:1.05rem;padding:18px 14px;}
+.bdemo:disabled{background:linear-gradient(135deg,#374151,#4b5563);}
+.bspbig{background:linear-gradient(135deg,#991b1b,#ef4444);color:white;
+  font-size:1.05rem;padding:18px 14px;}
+.demo-state{font-size:.86rem;color:var(--mut);text-align:center;margin-top:10px;
+  min-height:1.2em;line-height:1.35;}
+.demo-state .v{color:var(--acc);}
+.demo-state.warn{color:var(--warn);} .demo-state.warn .v{color:var(--warn);}
+.demo-state.run{color:var(--ok);} .demo-state.run .v{color:var(--ok);}
 </style>
 </head>
 <body>
-<h1>DD Trolley</h1>
-<div class="sub">Motor + stations + STS3215 + DS3245 + BNO055 IMU</div>
+<div class="appbar">
+  <span class="ttl">DD Trolley</span>
+  <button id="hburg" class="hburg" onclick="toggleView()" title="Advanced settings"
+          aria-label="Toggle advanced settings">&#9776;</button>
+</div>
 <div id="bn" class="bn">&#9203; ESC initialising...</div>
+
+<!-- ─────────────────────────  HOME VIEW  ────────────────────────── -->
+<div id="homeView">
+
+  <!-- ARM (home) -->
+  <div class="card">
+    <div class="ct">Arm Sequence</div>
+    <button class="barm" id="btnArm" onclick="doArm()">&#128274; Arm Motor</button>
+    <div id="apw" class="apw"><div id="apb" class="apb"></div></div>
+  </div>
+
+  <!-- DEMO -->
+  <div class="card">
+    <div class="ct">Demo</div>
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
+      <span id="stBadge" class="badge stopped">Stopped</span>
+      <span id="puUs" class="pu">1500 us</span>
+    </div>
+    <button class="bdemo" id="btnDemo" onclick="cmd('demostart')" disabled>
+      &#9654; Start Demo</button>
+    <div style="height:10px;"></div>
+    <button class="bspbig" id="btnStopHome" onclick="cmd('stop')" disabled>
+      &#9646;&#9646; Stop</button>
+    <div id="demoState" class="demo-state">Arm the motor to enable the demo.</div>
+  </div>
+
+</div>
+
+<!-- ───────────────────────  ADVANCED VIEW  ──────────────────────── -->
+<div id="advView">
 
 <!-- SPEED CONTROL -->
 <div class="card">
@@ -1307,20 +1576,9 @@ button:disabled{opacity:.3;cursor:not-allowed;}
   </div>
 </div>
 
-<!-- ARM -->
-<div class="card">
-  <div class="ct">Arm Sequence</div>
-  <button class="barm" id="btnArm" onclick="doArm()">&#128274; Arm Motor</button>
-  <div id="apw" class="apw"><div id="apb" class="apb"></div></div>
-</div>
-
 <!-- STATUS -->
 <div class="card">
   <div class="ct">Status</div>
-  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
-    <span id="stBadge" class="badge stopped">Stopped</span>
-    <span id="puUs" class="pu">1000 us</span>
-  </div>
   <div class="brs">
     <div class="br"><span class="bl">Target</span>
       <div class="bt"><div id="bTgt" class="bf tgt"></div></div><span id="pTgt" class="bp">0%</span></div>
@@ -1482,19 +1740,27 @@ button:disabled{opacity:.3;cursor:not-allowed;}
   <button class="bsv" style="width:100%;margin-top:8px;" onclick="cmd('save')">&#128190; Save to EEPROM</button>
 </div>
 
+</div><!-- /advView -->
+
 <script>
 const CMAX=100;
 let srv={escReady:false,arming:false,userArmed:false,motorOn:false,
-  pct:0,curPct:0,pulseUs:1000,apPct:0,rampSec:5.0,
+  pct:0,curPct:0,pulseUs:1500,apPct:0,rampSec:5.0,
   rawA:0,filtA:0,
   approachSlowing:false,gotoIdx:-1,apRemaining:0,
   posM:0,velRPM:0,velMs:0,encCounts:0,
-  cpr:16384,driveRatio:1,pitchMm:100,encInvert:false,
-  apSlw:2,apZone:870000,maxSpd:15,
+  cpr:16384,driveRatio:17.07,pitchMm:100,encInvert:true,
+  apSlw:6,apZone:3000000,maxSpd:12,
   stations:[],servoDeg:0,motorReverse:false,servoRetPend:false,
-  dsServoDeg:0,dsServoPulse:1500,dsSv0:1000,dsSv180:2000,
+  dsServoDeg:0,dsServoPulse:1500,dsSv0:680,dsSv180:1960,
+  demoState:'idle',demoActive:false,demoWaitMs:0,demoRemMs:0,
   imuReady:false,imuCal:false,imuCalibrating:false,imuCalPct:0,imuStab:true,imuAxis:1,imuAxisName:'Y-axis',imuRollRaw:0,imuRollFilt:0,imuX:0,imuY:0,imuZ:0};
 let drag=false,spdT=null,revFlag=false;
+
+function toggleView(){
+  document.body.classList.toggle('adv');
+  document.getElementById('hburg').classList.toggle('act',document.body.classList.contains('adv'));
+}
 
 function onSli(v){drag=true;document.getElementById('pctD').textContent=v;
   clearTimeout(spdT);spdT=setTimeout(()=>setSpd(v),100)}
@@ -1665,6 +1931,47 @@ function updateUI(d){
 
   document.getElementById('btnStart').disabled=!d.userArmed||d.motorOn||!d.escReady;
   document.getElementById('btnStop').disabled=!d.motorOn&&!d.approachSlowing;
+
+  // ── Home page: demo button + stop button + demo status line ──
+  const bd=document.getElementById('btnDemo');
+  const bsh=document.getElementById('btnStopHome');
+  const ds=document.getElementById('demoState');
+  const ready=d.userArmed&&d.escReady&&!d.arming;
+  bd.disabled=!ready||d.demoActive;
+  bsh.disabled=!d.motorOn&&!d.approachSlowing&&!d.demoActive;
+  if(d.demoActive){
+    bd.textContent='\u23f3 Demo Running';
+  } else {
+    bd.textContent='\u25b6 Start Demo';
+  }
+  let msg='', cls='demo-state';
+  if(!d.escReady){ msg='ESC initialising\u2026'; cls+=' warn'; }
+  else if(d.arming){ msg='Arming motor\u2026'; cls+=' warn'; }
+  else if(!d.userArmed){ msg='Arm the motor to enable the demo.'; }
+  else {
+    switch(d.demoState){
+      case 'imu-rezero':
+        msg='Re-zeroing IMU\u2026'; cls+=' warn'; break;
+      case 'boarding-180':{
+        const s=Math.ceil(d.demoRemMs/1000);
+        msg='Boarding pose: <span class="v">'+s+' s</span> remaining'; cls+=' run'; break;}
+      case 'boarding-return':
+        msg='Returning STS3215 to 0\u00b0\u2026'; cls+=' run'; break;
+      case 'goto-drone':
+        msg='En route to <span class="v">Drone Pickup</span>'+(d.approachSlowing?' (approach)':''); cls+=' run'; break;
+      case 'at-drone-wait':{
+        const s=Math.ceil(d.demoRemMs/1000);
+        msg='At Drone Pickup: <span class="v">'+s+' s</span> until Drive Thru'; cls+=' run'; break;}
+      case 'goto-drivethru':
+        msg='En route to <span class="v">Drive Thru</span>'+(d.approachSlowing?' (approach)':''); cls+=' run'; break;
+      case 'idle':
+      default:
+        msg='Press Start Demo to run the routine.';
+        break;
+    }
+  }
+  ds.className=cls;
+  ds.innerHTML=msg;
   const sl=document.getElementById('slider');
   sl.disabled=!d.userArmed||!d.escReady;
   if(!drag){sl.value=d.pct;document.getElementById('pctD').textContent=d.pct}
@@ -1732,7 +2039,7 @@ function updateUI(d){
 
 async function refresh(){ try{const r=await fetch('/status');const d=await r.json();updateUI(d)}catch(e){} }
 function poll(){
-  const fast=srv.arming||!srv.escReady||srv.approachSlowing||srv.motorOn||srv.servoRetPend||srv.imuStab;
+  const fast=srv.arming||!srv.escReady||srv.approachSlowing||srv.motorOn||srv.servoRetPend||srv.imuStab||srv.demoActive;
   setTimeout(async()=>{await refresh();poll()},fast?200:600)
 }
 poll();refresh();
@@ -1813,6 +2120,18 @@ void handleStatus() {
   j+="\"apSlw\":"         +String(approachSlowPct,1)+",";
   j+="\"apZone\":"        +String(approachZoneCount)+",";
   j+="\"maxSpd\":"        +String(maxSpeedPct,1)+",";
+  // Demo state — UI uses these to show the demo button label and the
+  // 10 s drone-pickup countdown.  demoTimeRemainingMs is only nonzero in
+  // timed-wait states (boarding hold, drone-pickup wait).
+  uint32_t demoRemMs = 0;
+  if (demoStateDurationMs > 0) {
+    const uint32_t elapsed = millis() - demoStateStartMs;
+    demoRemMs = (elapsed >= demoStateDurationMs) ? 0 : (demoStateDurationMs - elapsed);
+  }
+  j+="\"demoState\":\""   +String(demoStateName(demoState))+"\",";
+  j+="\"demoActive\":"    +String(demoState!=DEMO_IDLE?"true":"false")+",";
+  j+="\"demoWaitMs\":"    +String(demoStateDurationMs)+",";
+  j+="\"demoRemMs\":"     +String(demoRemMs)+",";
   j+="\"lineArmed\":"     +String((approachSlowing&&gotoStationIdx>=0&&motorOn)?"true":"false")+",";
   j+="\"lineSensed\":"    +String(lineCurrentState?"false":"true")+",";
   j+="\"stations\":"      +stArr;
@@ -1842,7 +2161,14 @@ void handleCmd() {
     servoReturnPending=false; pendingGotoIdx=-1;
     gotoStationIdx=-1;
     gotoTargetCount=0;
+    cancelDemo("user stop");
     Serial.println("STOP");
+  }
+  else if (a=="demostart") {
+    startDemo();
+  }
+  else if (a=="demostop") {
+    cancelDemo("user demo-stop");
   }
   else if (a=="speed") {
     if (server.hasArg("pct"))
@@ -2146,6 +2472,9 @@ void loop() {
 
   // Goto approach check (always)
   updateGotoApproach();
+
+  // Demo automation state machine
+  updateDemo();
 
   // Ramp engine
   if (escReady&&!arming) updateRamp();
