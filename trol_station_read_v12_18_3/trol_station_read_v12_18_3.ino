@@ -229,12 +229,6 @@ constexpr uint32_t ENC_TASK_PERIOD_MS = 5;
 // ── Line sensor (TCRT5000, active-LOW) ───────────────────────────────────
 // Same period as encoder task — matched so the sensor is never the slow path.
 constexpr uint32_t LINE_TASK_PERIOD_MS   = 5;
-// Debounce: require this many consecutive LOW samples (each LINE_TASK_PERIOD_MS
-// apart) before declaring a line.  3 samples * 5 ms = 15 ms minimum line dwell.
-// A real line under the sensor at approach speed lasts much longer than this,
-// while NeoPixel / motor-PWM crosstalk on GPIO6 from neighbouring pins is
-// only sub-millisecond.  Set to 1 to disable debouncing entirely.
-constexpr uint8_t  LINE_LOW_DEBOUNCE_TICKS = 3;
 
 // ── STS3215 servo (URT-1 half-duplex over Serial1) ───────────────────────
 constexpr uint8_t  STS_SERVO_ID             = 1;
@@ -684,45 +678,23 @@ void encoderTask(void* /*pvParameters*/) {
 // ═══════════════════════════════════════════════════════════════════════════
 //  LINE SENSOR TASK — runs on core 0, period = LINE_TASK_PERIOD_MS
 //
-//  Reads the TCRT5000 (active-LOW, internal pull-up) every 5 ms.
+//  Reads the TCRT5000 on D5 (active-LOW, internal pull-up) every 5 ms.
+//  The ONLY stop condition this task generates:
+//    A 1→0 edge (HIGH→LOW, sensor newly detects a line) while the trolley
+//    is inside the approach zone (approachSlowing == true).
 //
-//  Stop condition (debounced level trigger):
-//    The pin must read LOW for LINE_LOW_DEBOUNCE_TICKS consecutive samples
-//    while the trolley is inside the approach zone of an active goto
-//    (approachSlowing && gotoStationIdx>=0 && motorOn).  Any HIGH sample
-//    resets the streak to zero, so sub-tick glitches from NeoPixel / motor
-//    PWM crosstalk cannot trigger a false stop.  A real line dwells under
-//    the sensor for tens to hundreds of milliseconds at approach speed,
-//    well above the 15 ms (3 * 5 ms) debounce window.
+//  On that edge the task sets lineStopPending = true.
+//  The main loop reads lineStopPending in updateGotoApproach() and calls
+//  onStationArrival() immediately, keeping all motor/servo writes on core 1.
 //
-//  Why level + debounce instead of pure edge:
-//    A pure edge trigger (HIGH->LOW transition) misses the line if a
-//    pre-zone glitch latches the previous-state variable to LOW: when the
-//    real line arrives inside the zone there is no rising edge to reset
-//    the latch, so the firmware sees no transition.  Level + debounce
-//    avoids that aliasing while still rejecting noise.
-//
-//  Once the streak hits the threshold, lineStopPending=true is published.
-//  The main loop consumes it in updateGotoApproach() which calls
-//  onStationArrival(), clearing motorOn / approachSlowing -- so a sustained
-//  LOW only stops the trolley once per zone entry.
-//
-//  Outside the approach zone the sensor is still sampled every tick so the
-//  /status JSON's lineSensed field stays live for UI feedback, but the
-//  debounce counter is held at zero and the stop flag is never raised.
-//
-//  lineCurrentState is published every tick for UI telemetry:
+//  lineCurrentState is updated every tick for UI telemetry:
 //    true  = pin HIGH = sensor output "1" = no line
 //    false = pin LOW  = sensor output "0" = line detected
 // ═══════════════════════════════════════════════════════════════════════════
 void lineSensorTask(void* /*pvParameters*/) {
-  // Consecutive-LOW debounce counter.  Reset to 0 on any HIGH sample or
-  // whenever the trolley leaves the approach-zone armed state.
-  static uint8_t lowStreak   = 0;
-  // Latched once-per-stop log so the serial monitor reports the trigger
-  // exactly once per zone entry, instead of spamming every 5 ms while the
-  // trolley is rolling over the line.
-  static bool    stopLatched = false;
+  // Previous raw pin reading — used purely for edge detection.
+  // Initialise HIGH (no line) so the very first LOW never fires spuriously.
+  static bool prevHigh = true;
 
   TickType_t xLastWakeTime = xTaskGetTickCount();
   const TickType_t xPeriod = pdMS_TO_TICKS(LINE_TASK_PERIOD_MS);
@@ -735,36 +707,19 @@ void lineSensorTask(void* /*pvParameters*/) {
     // Publish current state for UI telemetry (volatile byte write — atomic).
     lineCurrentState = curHigh;
 
-    // ── Debounced level-trigger stop while inside the approach zone ───────
-    // Reading approachSlowing / gotoStationIdx / motorOn from core 1 is safe:
-    // they are bool/int32 aligned globals updated only on core 1 while we
-    // only read them here — no torn read is possible.
-    const bool armed = (approachSlowing && gotoStationIdx >= 0 && motorOn);
-
-    if (!armed) {
-      // Outside the zone: hold the debounce counter at 0 and re-arm the
-      // once-per-zone log latch.  This guarantees the next zone entry
-      // requires a fresh streak of LOW samples to fire.
-      lowStreak   = 0;
-      stopLatched = false;
-      continue;
-    }
-
-    if (curHigh) {
-      // Any HIGH sample resets the streak — sub-tick glitches cannot fire.
-      lowStreak = 0;
-    } else if (lowStreak < 0xFF) {
-      lowStreak++;
-    }
-
-    if (lowStreak >= LINE_LOW_DEBOUNCE_TICKS) {
-      lineStopPending = true;   // volatile byte write — seen immediately by core 1
-      if (!stopLatched) {
-        stopLatched = true;
-        Serial.printf("Line sensor: LOW debounced (%u ticks) inside approach zone — stop pending.\n",
-                      (unsigned)lowStreak);
+    // ── Edge detect: 1→0 (prevHigh && !curHigh) ──────────────────────────
+    if (prevHigh && !curHigh) {
+      // Only arm the stop when the trolley is actively in the approach zone.
+      // Reading approachSlowing / gotoStationIdx / motorOn from core 1 is safe:
+      // they are bool/int32 aligned globals updated only on core 1 while we
+      // only read them here — no torn read is possible.
+      if (approachSlowing && gotoStationIdx >= 0 && motorOn) {
+        lineStopPending = true;   // volatile byte write — seen immediately by core 1
+        Serial.println("Line sensor: 1->0 edge — stop pending.");
       }
     }
+
+    prevHigh = curHigh;
   }
 }
 
