@@ -849,7 +849,12 @@ void startGotoMotion(int idx) {
   gotoStationIdx     = idx;
   motorOn            = true;
   motorReverse       = false;
-  // Speed is whatever throttlePct is currently set to by the user
+  // Auto-throttle to the configured max-speed limit on every goto.  This
+  // gives the operator a predictable cruise speed for station-to-station
+  // moves and avoids the previous behaviour where throttlePct was left at
+  // whatever the slider was set to (including 0 % after a station arrival,
+  // which would silently leave the trolley stationary).
+  throttlePct = (uint8_t)constrain((int)lroundf(maxSpeedPct), 1, (int)maxSpeedPct);
 
   // Clear any stale line sensor flag from the previous run.
   lineStopPending = false;
