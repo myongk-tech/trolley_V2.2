@@ -1,6 +1,6 @@
 # trolley_V2.2
-This code is to control trolley V2 used for demo.  It is the black and white trolleys.
-This uploaed version is v_12_18_3.  It removes the hobbywing ESC and adds the maxynos ESC.
+This code is to control trolley V2 used for DEMO PURPOSE.  It is for the black trolleys.
+This uploaed version is v_12_18_3_x.  It removes the hobbywing ESC and adds the maxynos ESC.
 
 ESC changed from HobbyWing FPV G2 (one-directional, LEDC 50 Hz, 1000–2000 µs)
  * to MAXYNOS 70A AM32 (bidirectional, ESP32Servo 80 Hz, 1250–1750 µs, neutral 1500 µs).
