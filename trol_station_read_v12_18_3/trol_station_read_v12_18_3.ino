@@ -678,23 +678,35 @@ void encoderTask(void* /*pvParameters*/) {
 // ═══════════════════════════════════════════════════════════════════════════
 //  LINE SENSOR TASK — runs on core 0, period = LINE_TASK_PERIOD_MS
 //
-//  Reads the TCRT5000 on D5 (active-LOW, internal pull-up) every 5 ms.
-//  The ONLY stop condition this task generates:
-//    A 1→0 edge (HIGH→LOW, sensor newly detects a line) while the trolley
-//    is inside the approach zone (approachSlowing == true).
+//  Reads the TCRT5000 (active-LOW, internal pull-up) every 5 ms.
+//  Stop condition:
+//    Any LOW level (sensor over a line) while the trolley is inside the
+//    approach zone of an active goto (approachSlowing && gotoStationIdx>=0
+//    && motorOn).  This is level-triggered, NOT edge-triggered, so it is
+//    robust against:
+//      - pre-zone glitches that would otherwise leave the previous-state
+//        variable in a bad place,
+//      - the trolley entering the approach zone already on top of a line.
 //
-//  On that edge the task sets lineStopPending = true.
-//  The main loop reads lineStopPending in updateGotoApproach() and calls
-//  onStationArrival() immediately, keeping all motor/servo writes on core 1.
+//  Once the gate fires, lineStopPending=true is published.  The main loop
+//  reads it in updateGotoApproach() and calls onStationArrival() which
+//  clears motorOn / approachSlowing — so a sustained LOW only triggers a
+//  single stop, and subsequent ticks while the line is still under the
+//  sensor are no-ops because the gate condition is no longer satisfied.
 //
-//  lineCurrentState is updated every tick for UI telemetry:
+//  Outside the approach zone the sensor is still sampled every tick so the
+//  /status JSON's lineSensed field stays live for UI feedback, but the
+//  stop flag is never raised.
+//
+//  lineCurrentState is published every tick for UI telemetry:
 //    true  = pin HIGH = sensor output "1" = no line
 //    false = pin LOW  = sensor output "0" = line detected
 // ═══════════════════════════════════════════════════════════════════════════
 void lineSensorTask(void* /*pvParameters*/) {
-  // Previous raw pin reading — used purely for edge detection.
-  // Initialise HIGH (no line) so the very first LOW never fires spuriously.
-  static bool prevHigh = true;
+  // Latched once-per-stop log so the serial monitor reports the trigger
+  // exactly once per zone entry, instead of spamming every 5 ms while the
+  // trolley is rolling over the line.
+  static bool stopLatched = false;
 
   TickType_t xLastWakeTime = xTaskGetTickCount();
   const TickType_t xPeriod = pdMS_TO_TICKS(LINE_TASK_PERIOD_MS);
@@ -707,19 +719,23 @@ void lineSensorTask(void* /*pvParameters*/) {
     // Publish current state for UI telemetry (volatile byte write — atomic).
     lineCurrentState = curHigh;
 
-    // ── Edge detect: 1→0 (prevHigh && !curHigh) ──────────────────────────
-    if (prevHigh && !curHigh) {
-      // Only arm the stop when the trolley is actively in the approach zone.
-      // Reading approachSlowing / gotoStationIdx / motorOn from core 1 is safe:
-      // they are bool/int32 aligned globals updated only on core 1 while we
-      // only read them here — no torn read is possible.
-      if (approachSlowing && gotoStationIdx >= 0 && motorOn) {
-        lineStopPending = true;   // volatile byte write — seen immediately by core 1
-        Serial.println("Line sensor: 1->0 edge — stop pending.");
-      }
-    }
+    // ── Level-triggered stop while inside the approach zone ───────────────
+    // Reading approachSlowing / gotoStationIdx / motorOn from core 1 is safe:
+    // they are bool/int32 aligned globals updated only on core 1 while we
+    // only read them here — no torn read is possible.
+    const bool armed = (approachSlowing && gotoStationIdx >= 0 && motorOn);
 
-    prevHigh = curHigh;
+    if (armed && !curHigh) {
+      lineStopPending = true;   // volatile byte write — seen immediately by core 1
+      if (!stopLatched) {
+        stopLatched = true;
+        Serial.println("Line sensor: LOW inside approach zone — stop pending.");
+      }
+    } else if (!armed) {
+      // Re-arm the once-per-zone log latch as soon as we leave the zone
+      // (motor stops, goto cancels, or a new goto begins).
+      stopLatched = false;
+    }
   }
 }
 
